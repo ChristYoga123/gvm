@@ -161,6 +161,37 @@ func ListAvailableVersions(lang string) ([]string, error) {
 	}
 }
 
+// ResolveVersionQuery mencari versi lengkap terbaru yang cocok dengan kueri versi yang diberikan.
+// Jika versionQuery kosong, fungsi ini akan mengembalikan versi terbaru yang tersedia.
+func ResolveVersionQuery(lang, versionQuery string) (string, error) {
+	// 1. Dapatkan semua versi yang tersedia secara online, sudah diurutkan dari yang terbaru.
+	availableVersions, err := ListAvailableVersions(lang)
+	if err != nil {
+		return "", fmt.Errorf("gagal mendapatkan daftar versi yang tersedia: %w", err)
+	}
+
+	if len(availableVersions) == 0 {
+		return "", fmt.Errorf("tidak ada versi yang tersedia secara online untuk %s", lang)
+	}
+
+	// 2. Jika tidak ada kueri versi, kembalikan versi pertama (terbaru).
+	if versionQuery == "" {
+		fmt.Printf("Tidak ada versi spesifik yang diminta, menggunakan versi terbaru: %s\n", availableVersions[0])
+		return availableVersions[0], nil
+	}
+
+	// 3. Cari versi pertama yang cocok dengan awalan kueri.
+	for _, v := range availableVersions {
+		if strings.HasPrefix(v, versionQuery) {
+			fmt.Printf("Menemukan versi yang cocok untuk kueri '%s': %s\n", versionQuery, v)
+			return v, nil
+		}
+	}
+
+	// 4. Jika tidak ada yang cocok, kembalikan error.
+	return "", fmt.Errorf("tidak ada versi yang cocok dengan kueri '%s' untuk %s", versionQuery, lang)
+}
+
 func listPythonVersions() ([]string, error) {
 	fmt.Println("Mengambil daftar versi dari https://www.python.org/ftp/python/...")
 	resp, err := http.Get("https://www.python.org/ftp/python/")

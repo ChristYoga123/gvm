@@ -19,12 +19,27 @@ func main() {
 
 	var installCmd = &cobra.Command{
 		Use:   "install [bahasa] [versi]",
-		Short: "Install versi bahasa pemrograman tertentu",
-		Args:  cobra.ExactArgs(2),
+		Short: "Install versi bahasa pemrograman tertentu. Jika versi tidak ditentukan, akan menginstal versi terbaru.",
+		// Izinkan 1 argumen (bahasa) atau 2 argumen (bahasa dan versi)
+		Args: cobra.RangeArgs(1, 2),
 		Run: func(cmd *cobra.Command, args []string) {
 			lang := args[0]
-			version := args[1]
-			if err := manager.Install(lang, version); err != nil {
+			var versionQuery string
+
+			// Tentukan kueri versi. Jika tidak ada, string akan kosong ("").
+			if len(args) == 2 {
+				versionQuery = args[1]
+			}
+
+			// Panggil fungsi baru untuk menyelesaikan kueri versi ke versi spesifik.
+			resolvedVersion, err := manager.ResolveVersionQuery(lang, versionQuery)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Lanjutkan dengan proses instalasi menggunakan versi yang sudah ditemukan.
+			if err := manager.Install(lang, resolvedVersion); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
