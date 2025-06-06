@@ -3,25 +3,32 @@ package manager
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"compress/gzip"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 
+	"github.com/hashicorp/go-version"
 	"github.com/schollz/progressbar/v3"
 )
 
-// Definisikan sumber unduhan. Dalam proyek nyata, ini bisa dari file konfigurasi JSON/YAML.
-var downloadSources = map[string]string{
-	"go":     "https://go.dev/dl/go%s.%s-%s.tar.gz",                   // versi, os, arch
-	"python": "https://www.python.org/ftp/python/%s/Python-%s.tar.xz", // Ini lebih rumit, seringkali perlu build dari source. Contoh ini menyederhanakan.
-	// Untuk Python, lebih mudah menggunakan pre-built binaries, tapi URL-nya sangat bervariasi.
-	// Untuk PHP, juga bervariasi.
-	// Kita akan fokus pada Go untuk contoh unduhan yang berfungsi penuh.
+// Definisikan sumber unduhan yang dibedakan berdasarkan OS.
+var downloadSources = map[string]map[string]string{
+	"go": {
+		"linux":   "https://go.dev/dl/go%s.%s-%s.tar.gz",
+		"darwin":  "https://go.dev/dl/go%s.%s-%s.tar.gz",
+		"windows": "https://go.dev/dl/go%s.%s-%s.zip",
+	},
+	"python": {
+		"windows": "https://www.python.org/ftp/python/%s/python-%s-embed-amd64.zip",
+	},
 }
 
 // GetBaseDir mengembalikan path ke direktori home ~/.gvm
@@ -52,7 +59,6 @@ func ListVersions(lang string) ([]string, error) {
 	langPath := filepath.Join(versionsDir, lang)
 	entries, err := os.ReadDir(langPath)
 	if err != nil {
-		// Jika direktori tidak ada, berarti belum ada versi yang terinstal
 		if os.IsNotExist(err) {
 			return []string{}, nil
 		}
@@ -81,23 +87,37 @@ func Install(lang, version string) error {
 		return nil
 	}
 
-	// Contoh ini hanya mengimplementasikan untuk Go karena URL-nya konsisten.
-	if lang != "go" {
+	osSources, langSupported := downloadSources[lang]
+	if !langSupported {
 		return fmt.Errorf("instalasi otomatis untuk '%s' belum didukung di contoh ini", lang)
 	}
 
-	url := fmt.Sprintf(downloadSources[lang], version, runtime.GOOS, runtime.GOARCH)
+	urlTemplate, osSupported := osSources[runtime.GOOS]
+	if !osSupported {
+		return fmt.Errorf("sistem operasi '%s' tidak didukung untuk instalasi otomatis %s", runtime.GOOS, lang)
+	}
+
+	url := fmt.Sprintf(urlTemplate, version, version)
+	if lang == "go" {
+		url = fmt.Sprintf(urlTemplate, version, runtime.GOOS, runtime.GOARCH)
+	}
+
 	fmt.Printf("Mengunduh %s versi %s dari %s\n", lang, version, url)
 
-	// Buat file sementara
-	tmpFile, err := os.CreateTemp("", "*.tar.gz")
+	fileSuffix := ".tmp"
+	if strings.HasSuffix(url, ".zip") {
+		fileSuffix = "*.zip"
+	} else if strings.HasSuffix(url, ".tar.gz") {
+		fileSuffix = "*.tar.gz"
+	}
+
+	tmpFile, err := os.CreateTemp("", fileSuffix)
 	if err != nil {
 		return fmt.Errorf("gagal membuat file sementara: %w", err)
 	}
 	defer os.Remove(tmpFile.Name())
 	defer tmpFile.Close()
 
-	// Unduh file dengan progress bar
 	req, _ := http.NewRequest("GET", url, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -109,27 +129,80 @@ func Install(lang, version string) error {
 		return fmt.Errorf("gagal mengunduh: status code %d", resp.StatusCode)
 	}
 
-	f, _ := os.OpenFile(tmpFile.Name(), os.O_CREATE|os.O_WRONLY, 0644)
-	defer f.Close()
-
 	bar := progressbar.DefaultBytes(
 		resp.ContentLength,
 		"mengunduh",
 	)
-	io.Copy(io.MultiWriter(f, bar), resp.Body)
-
+	io.Copy(io.MultiWriter(tmpFile, bar), resp.Body)
 	fmt.Println("\nUnduhan selesai. Mengekstrak...")
 
-	// Kembali ke awal file untuk dibaca
-	tmpFile.Seek(0, 0)
-
-	// Ekstrak arsip
-	if err := Untar(tmpFile, installPath); err != nil {
-		return fmt.Errorf("gagal mengekstrak arsip: %w", err)
+	if strings.HasSuffix(url, ".zip") {
+		if err := Unzip(tmpFile.Name(), installPath); err != nil {
+			return fmt.Errorf("gagal mengekstrak arsip .zip: %w", err)
+		}
+	} else {
+		tmpFile.Seek(0, 0)
+		if err := Untar(tmpFile, installPath); err != nil {
+			return fmt.Errorf("gagal mengekstrak arsip .tar.gz: %w", err)
+		}
 	}
 
 	fmt.Printf("✅ Berhasil menginstal %s versi %s\n", lang, version)
 	return nil
+}
+
+// ListAvailableVersions mengambil daftar versi yang tersedia dari sumber online.
+func ListAvailableVersions(lang string) ([]string, error) {
+	switch lang {
+	case "python":
+		return listPythonVersions()
+	default:
+		return nil, fmt.Errorf("pencarian versi otomatis untuk '%s' tidak didukung", lang)
+	}
+}
+
+func listPythonVersions() ([]string, error) {
+	fmt.Println("Mengambil daftar versi dari https://www.python.org/ftp/python/...")
+	resp, err := http.Get("https://www.python.org/ftp/python/")
+	if err != nil {
+		return nil, fmt.Errorf("gagal mengambil data: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status tidak ok: %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("gagal membaca body: %w", err)
+	}
+
+	re := regexp.MustCompile(`href="([0-9]+\.[0-9]+\.[0-9]+)/"`)
+	matches := re.FindAllStringSubmatch(string(body), -1)
+
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("tidak ada versi yang ditemukan, mungkin pola regex perlu diperbarui")
+	}
+
+	rawVersions := make([]*version.Version, 0, len(matches))
+	for _, match := range matches {
+		if len(match) > 1 {
+			v, err := version.NewVersion(match[1])
+			if err == nil {
+				rawVersions = append(rawVersions, v)
+			}
+		}
+	}
+
+	sort.Sort(sort.Reverse(version.Collection(rawVersions)))
+
+	sortedVersions := make([]string, len(rawVersions))
+	for i, v := range rawVersions {
+		sortedVersions[i] = v.Original()
+	}
+
+	return sortedVersions, nil
 }
 
 // GenerateUseCommand menghasilkan perintah shell untuk mengubah PATH
@@ -144,38 +217,35 @@ func GenerateUseCommand(lang, version string) (string, error) {
 		return "", fmt.Errorf("versi %s untuk %s tidak terinstal. Jalankan 'gvm install %s %s'", version, lang, lang, version)
 	}
 
-	// Path ke direktori bin bervariasi antar bahasa
 	var binPath string
 	switch lang {
 	case "go":
-		// Instalasi go dari tar.gz akan membuat folder 'go' di dalamnya
 		binPath = filepath.Join(versionPath, "go", "bin")
 	case "python":
-		binPath = filepath.Join(versionPath, "bin")
-	// Tambahkan case lain untuk php, java, dll.
+		binPath = versionPath
 	default:
 		return "", fmt.Errorf("bahasa '%s' tidak dikenali untuk perintah 'use'", lang)
 	}
 
-	// Membersihkan PATH dari instalasi gvm lainnya
 	originalPath := os.Getenv("PATH")
 	pathParts := filepath.SplitList(originalPath)
-
-	var newPathParts []string
 	baseDir, _ := GetBaseDir()
 
-	newPathParts = append(newPathParts, binPath) // Tambahkan path baru di depan
+	var newPathParts []string
+	newPathParts = append(newPathParts, binPath)
 
 	for _, part := range pathParts {
-		// Jika path lama bukan bagian dari gvm, pertahankan
-		if !strings.Contains(part, baseDir) {
+		if !strings.Contains(part, baseDir) && part != "" {
 			newPathParts = append(newPathParts, part)
 		}
 	}
 
 	finalPath := strings.Join(newPathParts, string(os.PathListSeparator))
 
-	// Mencetak perintah untuk dievaluasi oleh shell
+	if runtime.GOOS == "windows" {
+		// MENGHASILKAN PERINTAH POWERSHELL YANG BENAR
+		return fmt.Sprintf("$env:PATH = \"%s\"", finalPath), nil
+	}
 	return fmt.Sprintf("export PATH=\"%s\"", finalPath), nil
 }
 
@@ -189,7 +259,6 @@ func Untar(r io.Reader, dest string) error {
 
 	tr := tar.NewReader(gzr)
 
-	// Pastikan direktori tujuan ada
 	if err := os.MkdirAll(dest, 0755); err != nil {
 		return err
 	}
@@ -211,7 +280,6 @@ func Untar(r io.Reader, dest string) error {
 				return err
 			}
 		case tar.TypeReg:
-			// Pastikan direktori untuk file ini ada
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
 			}
@@ -226,4 +294,53 @@ func Untar(r io.Reader, dest string) error {
 			f.Close()
 		}
 	}
+}
+
+// Unzip mengekstrak arsip .zip
+func Unzip(src, dest string) error {
+	r, err := zip.OpenReader(src)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	if err := os.MkdirAll(dest, 0755); err != nil {
+		return err
+	}
+
+	for _, f := range r.File {
+		fpath := filepath.Join(dest, f.Name)
+		if !strings.HasPrefix(fpath, filepath.Clean(dest)+string(os.PathSeparator)) {
+			return fmt.Errorf("ilegal path file: %s", fpath)
+		}
+
+		if f.FileInfo().IsDir() {
+			os.MkdirAll(fpath, os.ModePerm)
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+			return err
+		}
+
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			return err
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			outFile.Close()
+			return err
+		}
+
+		_, err = io.Copy(outFile, rc)
+		outFile.Close()
+		rc.Close()
+
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
