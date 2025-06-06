@@ -31,6 +31,26 @@ var downloadSources = map[string]map[string]string{
 	},
 }
 
+// languageSource mendefinisikan sumber untuk mencari versi yang tersedia.
+type languageSource struct {
+	URL   string
+	Regex string
+}
+
+// availableVersionSources adalah peta terpusat untuk konfigurasi pencarian versi.
+// Untuk menambah bahasa baru, cukup tambahkan entri di sini.
+var availableVersionSources = map[string]languageSource{
+	"python": {
+		URL:   "https://www.python.org/ftp/python/",
+		Regex: `href="([0-9]+\.[0-9]+\.[0-9]+)/"`,
+	},
+	// CONTOH: Jika ingin menambah Node.js di masa depan:
+	// "node": {
+	// 	URL:   "https://nodejs.org/dist/",
+	// 	Regex: `href="v([0-9]+\.[0-9]+\.[0-9]+)/"`,
+	// },
+}
+
 // GetBaseDir mengembalikan path ke direktori home ~/.gvm
 func GetBaseDir() (string, error) {
 	home, err := os.UserHomeDir()
@@ -153,48 +173,18 @@ func Install(lang, version string) error {
 
 // ListAvailableVersions mengambil daftar versi yang tersedia dari sumber online.
 func ListAvailableVersions(lang string) ([]string, error) {
-	switch lang {
-	case "python":
-		return listPythonVersions()
-	default:
+	return fetchAndParseVersions(lang)
+}
+
+// fetchAndParseVersions adalah fungsi generik untuk mengambil dan mem-parsing versi dari sumber online.
+func fetchAndParseVersions(lang string) ([]string, error) {
+	source, supported := availableVersionSources[lang]
+	if !supported {
 		return nil, fmt.Errorf("pencarian versi otomatis untuk '%s' tidak didukung", lang)
 	}
-}
 
-// ResolveVersionQuery mencari versi lengkap terbaru yang cocok dengan kueri versi yang diberikan.
-// Jika versionQuery kosong, fungsi ini akan mengembalikan versi terbaru yang tersedia.
-func ResolveVersionQuery(lang, versionQuery string) (string, error) {
-	// 1. Dapatkan semua versi yang tersedia secara online, sudah diurutkan dari yang terbaru.
-	availableVersions, err := ListAvailableVersions(lang)
-	if err != nil {
-		return "", fmt.Errorf("gagal mendapatkan daftar versi yang tersedia: %w", err)
-	}
-
-	if len(availableVersions) == 0 {
-		return "", fmt.Errorf("tidak ada versi yang tersedia secara online untuk %s", lang)
-	}
-
-	// 2. Jika tidak ada kueri versi, kembalikan versi pertama (terbaru).
-	if versionQuery == "" {
-		fmt.Printf("Tidak ada versi spesifik yang diminta, menggunakan versi terbaru: %s\n", availableVersions[0])
-		return availableVersions[0], nil
-	}
-
-	// 3. Cari versi pertama yang cocok dengan awalan kueri.
-	for _, v := range availableVersions {
-		if strings.HasPrefix(v, versionQuery) {
-			fmt.Printf("Menemukan versi yang cocok untuk kueri '%s': %s\n", versionQuery, v)
-			return v, nil
-		}
-	}
-
-	// 4. Jika tidak ada yang cocok, kembalikan error.
-	return "", fmt.Errorf("tidak ada versi yang cocok dengan kueri '%s' untuk %s", versionQuery, lang)
-}
-
-func listPythonVersions() ([]string, error) {
-	fmt.Println("Mengambil daftar versi dari https://www.python.org/ftp/python/...")
-	resp, err := http.Get("https://www.python.org/ftp/python/")
+	fmt.Printf("Mengambil daftar versi dari %s...\n", source.URL)
+	resp, err := http.Get(source.URL)
 	if err != nil {
 		return nil, fmt.Errorf("gagal mengambil data: %w", err)
 	}
@@ -209,11 +199,11 @@ func listPythonVersions() ([]string, error) {
 		return nil, fmt.Errorf("gagal membaca body: %w", err)
 	}
 
-	re := regexp.MustCompile(`href="([0-9]+\.[0-9]+\.[0-9]+)/"`)
+	re := regexp.MustCompile(source.Regex)
 	matches := re.FindAllStringSubmatch(string(body), -1)
 
 	if len(matches) == 0 {
-		return nil, fmt.Errorf("tidak ada versi yang ditemukan, mungkin pola regex perlu diperbarui")
+		return nil, fmt.Errorf("tidak ada versi yang ditemukan, mungkin pola regex perlu diperbarui untuk %s", lang)
 	}
 
 	rawVersions := make([]*version.Version, 0, len(matches))
@@ -234,6 +224,33 @@ func listPythonVersions() ([]string, error) {
 	}
 
 	return sortedVersions, nil
+}
+
+// ResolveVersionQuery mencari versi lengkap terbaru yang cocok dengan kueri versi yang diberikan.
+// Jika versionQuery kosong, fungsi ini akan mengembalikan versi terbaru yang tersedia.
+func ResolveVersionQuery(lang, versionQuery string) (string, error) {
+	availableVersions, err := ListAvailableVersions(lang)
+	if err != nil {
+		return "", fmt.Errorf("gagal mendapatkan daftar versi yang tersedia: %w", err)
+	}
+
+	if len(availableVersions) == 0 {
+		return "", fmt.Errorf("tidak ada versi yang tersedia secara online untuk %s", lang)
+	}
+
+	if versionQuery == "" {
+		fmt.Printf("Tidak ada versi spesifik yang diminta, menggunakan versi terbaru: %s\n", availableVersions[0])
+		return availableVersions[0], nil
+	}
+
+	for _, v := range availableVersions {
+		if strings.HasPrefix(v, versionQuery) {
+			fmt.Printf("Menemukan versi yang cocok untuk kueri '%s': %s\n", versionQuery, v)
+			return v, nil
+		}
+	}
+
+	return "", fmt.Errorf("tidak ada versi yang cocok dengan kueri '%s' untuk %s", versionQuery, lang)
 }
 
 // GenerateUseCommand menghasilkan perintah shell untuk mengubah PATH
@@ -274,7 +291,6 @@ func GenerateUseCommand(lang, version string) (string, error) {
 	finalPath := strings.Join(newPathParts, string(os.PathListSeparator))
 
 	if runtime.GOOS == "windows" {
-		// MENGHASILKAN PERINTAH POWERSHELL YANG BENAR
 		return fmt.Sprintf("$env:PATH = \"%s\"", finalPath), nil
 	}
 	return fmt.Sprintf("export PATH=\"%s\"", finalPath), nil
